@@ -1,4 +1,3 @@
-import sys
 import subprocess
 import socket
 import tempfile
@@ -7,7 +6,6 @@ import ssl
 import json
 import time
 import signal
-from threading import Thread
 from multiprocessing import Process
 from urllib.request import urlopen, Request
 from urllib.error import URLError
@@ -210,6 +208,9 @@ def check_validation_server(host, port, protocols=['acme-tls/1'], hostname='_'):
 def test_usage(env):
     # show help
     assert run_certs('-h')[0] == 0
+
+    # version
+    assert run_certs('--version')[0] == 0
 
     # run without arguments
     assert run_certs()[0] == 2

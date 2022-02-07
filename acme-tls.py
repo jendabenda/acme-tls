@@ -58,13 +58,14 @@ from multiprocessing import Process, Queue
 from urllib.request import urlopen, Request
 from urllib.parse import urlparse
 
-# TODO server tests
-
 
 class cfg:
     """
     Server configuration
     """
+    # acme-tls version
+    version = '1.0'
+
     # server ciphers
     server_ciphers = ('ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256')
 
@@ -1204,8 +1205,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
     )
-    parser.add_argument('--path', metavar='account_dir', required=True, help='path to account directory with certificates')
-    parser.add_argument('--acme', metavar='ca', required=True, type=ca, help='certificate authority name or ACME url')
+
+    parser.add_argument('--path', metavar='account_dir', help='path to account directory with certificates')
+    parser.add_argument('--acme', metavar='ca', type=ca, help='certificate authority name or ACME url')
     parser.add_argument('--contact', metavar='contact', nargs='*', help='update account contact information')
     parser.add_argument('--new-account-key', action='store_true', default=False, help='create new account key if does not exist')
     parser.add_argument('--host', metavar='host', default='::1', help='validation server hostname, by default ::1')
@@ -1213,11 +1215,18 @@ def main():
     parser.add_argument('--group', metavar='group', default=None, help='validation and domain certificates user group')
     parser.add_argument('--schedule', metavar='schedule', default='4', type=schedule, help='when to schedule certificate check (hour | once | force), by default 4')
     parser.add_argument('--done-cmd', metavar='cmd', default=None, help='command to run after certificates validation is done')
+    parser.add_argument('--version', action='store_true', help='print version info')
     parser.add_argument('--testing', action='store_true', default=False, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    # run watchdog
-    return run_watchdog(args)
+    if args.version:
+        print(f'acme-tls {cfg.version}')
+        return 0
+    elif args.path is not None and args.acme is not None:
+        return run_watchdog(args)
+    else:
+        parser.error('--path and --acme are required attributes')
+        return 2
 
 
 # entrypoint
