@@ -13,7 +13,7 @@ Quick start:
  4. create account key and run validation server with (assuming letsencrypt as CA)
     acme-tls.py --path account --acme letsencrypt --new-account-key --schedule once
  5. check if certificates were generated correctly, run validation server (assuming nginx proxy)
-    acme-tls.py --path account --acme letsencrypt --done-cmd 'systemctl reload nginx'
+    acme-tls.py --path account --acme letsencrypt --done-cmd 'sudo systemctl reload nginx'
 
 Example domains.list configuration:
 
@@ -527,7 +527,7 @@ def get_certificate(acme_directory, account_path, account_info, domains, group, 
             if reserve > timedelta(days=cfg.validity_reserve):
                 # skip validation, it is not needed yet
                 print(f'  certificate for {main_domain} does not need renewal, expiration in {reserve.days} days, skipping')
-                return
+                return False
         except (ValueError, OSError) as exc:
             print(f'  cannot parse current domain certificate date from {domain_cert_name}, continuing anyway: {exc}')
 
@@ -768,6 +768,8 @@ def get_certificate(acme_directory, account_path, account_info, domains, group, 
         except FileNotFoundError:
             pass  # probably already renamed
 
+    return True  # new certificate was issued
+
 
 def run_validation(account_path, acme_url, domains, contact, group, renew, event_queue, testing):
     """
@@ -776,6 +778,7 @@ def run_validation(account_path, acme_url, domains, contact, group, renew, event
     try:
         print('validation started')
         validated = 0
+        issued = 0
         validate_acme = testing is None
 
         # get openssl config for validation certificate
@@ -846,7 +849,7 @@ def run_validation(account_path, acme_url, domains, contact, group, renew, event
             validate_acme,
         )
         account_info['id'] = headers['Location']
-        print('{0} account id: {1}'.format('registered' if code == 201 else 'already registered', account_info['id']))
+        print('{} account id: {}'.format('registered' if code == 201 else 'already registered', account_info['id']))
 
         # update account contact
         if contact:
@@ -864,7 +867,7 @@ def run_validation(account_path, acme_url, domains, contact, group, renew, event
         # get certificates
         for domain_names in domains:
             try:
-                get_certificate(
+                issued += int(get_certificate(
                     acme_directory,
                     account_path,
                     account_info,
@@ -873,7 +876,7 @@ def run_validation(account_path, acme_url, domains, contact, group, renew, event
                     renew,
                     openssl_config,
                     testing,
-                )
+                ))
                 validated += 1
             except RuntimeError as exc:
                 print(exc)
@@ -883,7 +886,7 @@ def run_validation(account_path, acme_url, domains, contact, group, renew, event
                 continue
 
         print('validation done')
-        event_queue.put('validation_done')
+        event_queue.put(('validation_done', issued))
     except RuntimeError as exc:
         print(exc)
         sys.exit(1)
@@ -926,12 +929,21 @@ def event_listener(queue, done_cmd):
     Listen to applicaition events
     """
     while True:
-        event = queue.get()
+        event, data = queue.get()
         if event == 'validation_done':
             # run done command
+            issued = data
             if done_cmd:
-                print(f'watchdog: running user command: {done_cmd}')
-                subprocess.run(done_cmd, shell=True)
+                if issued > 0:
+                    print(f'watchdog: running user command: {done_cmd}')
+                    try:
+                        subprocess.run(done_cmd, shell=True)
+                    except Exception:
+                        print('watchdog: cannot run user command: {done_cmd}')
+                        traceback.print_exc()
+                else:
+                    print('watchdog: no new certificates were issued, not running done callback')
+
         else:
             assert False
 
@@ -1072,7 +1084,7 @@ def run_watchdog(args):
             # compute next schedule
             if args.schedule in ('once', 'force') and first_schedule:
                 scheduled = datetime.now().replace(microsecond=0) - timedelta(days=1)
-            else:
+            else:  # can miss schedule on hup, certs have been renewed anyway
                 scheduled = next_schedule(args.schedule)
             first_schedule = False
 

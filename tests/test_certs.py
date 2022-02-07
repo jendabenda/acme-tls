@@ -12,7 +12,7 @@ from urllib.error import URLError
 
 import pytest
 from cryptography import x509
-from cryptography.hazmat.primitives import serialization as crypto_serialization
+from cryptography.hazmat.primitives import serialization as crypto_serialization, hashes as crypto_hashes
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
 
 import mockdns
@@ -183,6 +183,8 @@ def check_cert_domains(path, domains):
     cert_domains = set(extension.value.get_values_for_type(x509.DNSName))
     assert cert_domains == set(domains)
 
+    return parsed_cert.fingerprint(crypto_hashes.SHA256())
+
 
 def check_validation_server(host, port, protocols=['acme-tls/1'], hostname='_'):
     """
@@ -203,6 +205,45 @@ def check_validation_server(host, port, protocols=['acme-tls/1'], hostname='_'):
     except Exception as exc:
         print(f'validation server check: {exc}')
         return False
+
+
+def wait_for_file(path):
+    """
+    Wait file to be present
+    """
+    check_attempts = 10
+    while not os.path.isfile(path):
+        check_attempts -= 1
+        assert check_attempts >  0
+        time.sleep(2)
+
+
+def wait_for_domain_cert(path, domain):
+    """
+    Wait and check domain certificate when ready
+    """
+    domain_cert = os.path.join(path, 'certificates', domain, 'domain.crt')
+    wait_for_file(domain_cert)
+    return check_cert_domains(domain_cert, [domain])
+
+
+def wait_for_validation_server():
+    """
+    Wait for validation server to be ready
+    """
+    check_attempts = 5
+    while not check_validation_server(localhost, acme_tls_port):
+        check_attempts -= 1
+        assert check_attempts > 0
+        time.sleep(2)
+
+
+def update_domains_list(path, domains_list):
+    """
+    Update domains.list configuration
+    """
+    with open(os.path.join(path, 'domains.list'), 'w') as domains_list_file:
+        domains_list_file.write('\n'.join(domains_list))
 
 
 def test_usage(env):
@@ -471,19 +512,6 @@ def test_removals(env):
 
 
 def test_validation_server(env):
-    def wait_and_check(domain):
-        domain_cert = os.path.join(path, 'certificates', domain, 'domain.crt')
-        check_attempts = 10
-        while not os.path.isfile(domain_cert):
-            check_attempts -= 1
-            assert check_attempts >  0
-            time.sleep(2)
-        check_cert_domains(domain_cert, [domain])
-
-    def update_domains_list(domain):
-        with open(os.path.join(path, 'domains.list'), 'w') as domains_list_file:
-            domains_list_file.write(domain)
-
     try:
         account = Account(['domain1'])
         path = account.tmpdir.name
@@ -500,11 +528,7 @@ def test_validation_server(env):
         )
 
         # wait for server to come up
-        check_attempts = 5
-        while not check_validation_server(localhost, acme_tls_port):
-            check_attempts -= 1
-            assert check_attempts > 0
-            time.sleep(2)
+        wait_for_validation_server()
 
         # checks
         assert not check_validation_server(localhost, acme_tls_port, hostname='missing.challenges')
@@ -514,31 +538,128 @@ def test_validation_server(env):
         # remove fallbacks
         os.unlink(os.path.join(path, 'fallback.key'))
         process.send_signal(signal.SIGHUP)
-        wait_and_check('domain1')
+        wait_for_domain_cert(path, 'domain1')
 
         # remove fallbacks
-        update_domains_list('domain2')
+        update_domains_list(path, ['domain2'])
         os.unlink(os.path.join(path, 'fallback.crt'))
         process.send_signal(signal.SIGHUP)
-        wait_and_check('domain2')
+        wait_for_domain_cert(path, 'domain2')
 
         # remove fallbacks
-        update_domains_list('domain3')
+        update_domains_list(path, ['domain3'])
         os.unlink(os.path.join(path, 'fallback.key'))
         os.unlink(os.path.join(path, 'fallback.crt'))
         process.send_signal(signal.SIGHUP)
-        wait_and_check('domain3')
+        wait_for_domain_cert(path, 'domain3')
 
         # wait for new domain cert
-        update_domains_list('domain4')
+        update_domains_list(path, ['domain4'])
         process.send_signal(signal.SIGHUP)
-        wait_and_check('domain4')
+        wait_for_domain_cert(path, 'domain4')
     finally:
         # cleanup
         try:
             process.send_signal(signal.SIGINT)
             stdout, _ = process.communicate(timeout=5)
             print(stdout.decode('utf8'))
+        except Exception:
+            pass
+        account.cleanup()
+
+
+def test_done_command(env):
+    try:
+        account = Account(['domain1'])
+        path = account.tmpdir.name
+        done_file_name_1 = os.path.join(path, '.ready_file1')
+        done_file_name_2 = os.path.join(path, '.ready_file2')
+
+        # run validation server
+        process = run_certs(
+            '--path', path,
+            '--host', localhost,
+            '--port', acme_tls_port,
+            '--acme', f'{pebble_url}/dir',
+            '--new-account-key',
+            '--done-cmd', f'echo -n "file1" | cat > "{done_file_name_1}" && echo -n "file2" | cat > "{done_file_name_2}"',
+            '--testing',
+            wait=False,
+        )
+
+        # wait for server to come up
+        wait_for_validation_server()
+
+        # wait for domain cert
+        process.send_signal(signal.SIGHUP)
+        domain1_fprint = wait_for_domain_cert(path, 'domain1')
+        wait_for_file(done_file_name_1)
+        wait_for_file(done_file_name_2)
+        with open(done_file_name_1) as done_file:
+            assert done_file.read() == 'file1'
+        with open(done_file_name_2) as done_file:
+            assert done_file.read() == 'file2'
+
+        # remove done files
+        os.unlink(done_file_name_1)
+        os.unlink(done_file_name_2)
+
+        # wait for new domain cert
+        update_domains_list(path, ['domain1', 'domain2'])
+        process.send_signal(signal.SIGHUP)
+        domain2_fprint = wait_for_domain_cert(path, 'domain2')
+        wait_for_file(done_file_name_1)
+        wait_for_file(done_file_name_2)
+        with open(done_file_name_1) as done_file:
+            assert done_file.read() == 'file1'
+        with open(done_file_name_2) as done_file:
+            assert done_file.read() == 'file2'
+
+        # remove done files, make it directory, so next done command will fail
+        os.unlink(done_file_name_1)
+        os.unlink(done_file_name_2)
+        os.mkdir(done_file_name_2)
+
+        # wait for new domain cert
+        update_domains_list(path, ['domain1', 'domain2', 'domain3'])
+        process.send_signal(signal.SIGHUP)
+        domain3_fprint = wait_for_domain_cert(path, 'domain3')
+        wait_for_file(done_file_name_1)
+        time.sleep(1)  # time to complete done command
+        assert os.path.isdir(done_file_name_2)
+
+        # check domain fingerprints
+        update_domains_list(path, ['domain1', 'domain2', 'domain3', 'domain4'])
+        process.send_signal(signal.SIGHUP)
+        domain4_fprint = wait_for_domain_cert(path, 'domain4')
+        assert domain1_fprint == wait_for_domain_cert(path, 'domain1')
+        assert domain2_fprint == wait_for_domain_cert(path, 'domain2')
+        assert domain3_fprint == wait_for_domain_cert(path, 'domain3')
+
+        # remove done files
+        os.unlink(done_file_name_1)
+        os.rmdir(done_file_name_2)
+
+        # done cmd should not run
+        process.send_signal(signal.SIGHUP)
+        time.sleep(3)  # to to complete certificate validity checks
+        assert domain1_fprint == wait_for_domain_cert(path, 'domain1')
+        assert domain2_fprint == wait_for_domain_cert(path, 'domain2')
+        assert domain3_fprint == wait_for_domain_cert(path, 'domain3')
+        assert domain4_fprint == wait_for_domain_cert(path, 'domain4')
+        assert not os.path.isfile(done_file_name_1)
+        assert not os.path.isfile(done_file_name_2)
+    finally:
+        # cleanup
+        try:
+            process.send_signal(signal.SIGINT)
+            stdout, _ = process.communicate(timeout=5)
+            stdout = stdout.decode('utf8')
+
+            # check that last done comman was not run
+            assert stdout.split('\n')[-2] == 'watchdog: no new certificates were issued, not running done callback\n'
+
+            print(stdout)
         except Exception:
             pass
         account.cleanup()
