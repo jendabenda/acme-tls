@@ -13,7 +13,7 @@ to either your https server or `acme-tls`. Supported crypto is elliptic curve `s
  4. create account key and run validation server with (assuming [let's encrypt](https://letsencrypt.org/) as CA)
     `acme-tls.py --path account --acme letsencrypt --new-account-key --schedule once`
  5. check if certificates were generated correctly, run validation server (assuming nginx proxy)
-    `acme-tls.py --path account --acme letsencrypt --done-cmd 'systemctl reload nginx'`
+    `acme-tls.py --path account --acme letsencrypt --done-cmd 'sudo systemctl reload nginx'`
 
 ## Example configuration:
 
@@ -32,7 +32,7 @@ example.com, subdomain.example.com  # create multidomain certificate
 
 ## License
 
-Author: Jan Procházka
+Author: Jan Procházka \
 License: none, public domain
 
 ## Extra
