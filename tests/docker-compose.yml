@@ -1,0 +1,14 @@
+version: '3'
+
+services:
+  pebble:
+    image: letsencrypt/pebble
+    command: pebble -config /test/pebble-config.json -strict -dnsserver '[::1]:14053'
+    network_mode: host
+    environment:
+      - PEBBLE_VA_NOSLEEP=1
+      - PEBBLE_VA_ALWAYS_VALID=0
+      - PEBBLE_WFE_NONCEREJECT=50
+      - PEBBLE_AUTHZREUSE=100
+    volumes:
+      - ./pebble-config.json:/test/pebble-config.json
