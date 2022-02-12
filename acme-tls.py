@@ -81,7 +81,7 @@ class cfg:
     Server configuration
     """
     # acme-tls version
-    version = '1.0'
+    version = '1.1'
 
     # server ciphers
     server_ciphers = ('ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256')
