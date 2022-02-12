@@ -65,6 +65,21 @@ stream {
 }
 ```
 
+## Usage
+```bash
+acme-tls new-account account_path
+acme-tls update-account account_path
+acme-tls deactivate-account account_path
+acme-tls run account_path
+acme-tls renew account_path --domain domain ... [--force]
+acme-tls renew-all account_path [--force]
+acme-tls revoke account_path --domain domain ...
+acme-tls revoke-all account_path
+acme-tls version
+
+# all commands accept --help to show detailed usage information
+```
+
 ## License
 
 Author: Jan Procházka \
