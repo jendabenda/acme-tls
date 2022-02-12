@@ -24,7 +24,7 @@ acme-tls run account_path         # obtain certificates, monitor and renew if ne
 # domain certificates are stored in acount_path/certificates
 ```
 
-**account_path/config**
+_account_path/config_
 ```bash
 acme = letsencrypt  # acme certificate authority, i.e. letsencrypt,
                     # letsencrypt_test or acme directory url
@@ -36,14 +36,14 @@ schedule = 4  # hour which acme-tls tries to check and renew domain certificates
 done_cmd =    # command to be run after successful batch with new domain certificates, optional
 ```
 
-**account_path/domains.list**
+_account_path/domains.list_
 ```bash
 example.org
 example.net
 example.com, subdomain.example.com  # create multidomain certificate
 ```
 
-**nginx configuration**
+_nginx configuration_
 ```nginx
 # load stream module
 load_module /usr/lib/nginx/modules/ngx_stream_module.so;
