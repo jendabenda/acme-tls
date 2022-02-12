@@ -6,6 +6,7 @@ import ssl
 import json
 import time
 import signal
+import grp
 from multiprocessing import Process
 from urllib.request import urlopen, Request
 from urllib.error import URLError
@@ -14,6 +15,8 @@ import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization as crypto_serialization, hashes as crypto_hashes
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
+from cryptography.hazmat.backends import default_backend as crypto_default_backend
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 import mockdns
 
@@ -35,9 +38,9 @@ pebble_management_url = f'https://[{localhost}]:{pebble_management_port}'
 pebble_wrong_url = f'https://[{localhost}]:{pebble_wrong_port}'
 
 
-def run_certs(*args, wait=True):
+def run_acme_tls(*args, wait=True):
     """
-    Run certs, return stdout, stderr and exit code
+    Run acme-tls, return stdout, stderr and exit code
     """
     process = subprocess.Popen(['./acme-tls.py'] + [str(arg) for arg in args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if wait:
@@ -53,7 +56,7 @@ def run_certs(*args, wait=True):
         return process
 
 
-def request(url, data=None):
+def acme_request(url, data=None):
     """
     Make https request to pebble
     """
@@ -86,6 +89,13 @@ class Environment:
             ), daemon=True)
         self.mockdns.start()
 
+        # minimal config
+        self.config = {
+            'acme': f'{pebble_url}/dir',
+            'host': localhost,
+            'port': acme_tls_port
+        }
+
         # pregenerate account rsa private key
         self.account_key_rsa = rsa.generate_private_key(
             public_exponent=65537,
@@ -117,7 +127,7 @@ class Environment:
         # wait for pebble to come up
         while True:
             try:
-                request(f'{pebble_url}/dir')
+                acme_request(f'{pebble_url}/dir')
                 break
             except URLError:
                 time.sleep(1)
@@ -135,18 +145,22 @@ class Account:
     Account dir setup
     """
 
-    def __init__(self, domains_list=None, account_key=None):
+    def __init__(self, config=None, account_key=None, domains_list=None):
         self.tmpdir = tempfile.TemporaryDirectory()
-        self.domais_list = domains_list
-        self.account_key = account_key
 
-        if domains_list:
+        if config is not None:
+            with open(os.path.join(self.tmpdir.name, 'config'), 'w') as config_file:
+                if isinstance(config, dict):
+                    config = (f'{key} = {value}' for key, value in config.items())
+                config_file.write('\n'.join(config))
+
+        if account_key is not None:
+            with open(os.path.join(self.tmpdir.name, 'account.key'), 'wb') as account_file:
+                account_file.write(account_key)
+
+        if domains_list is not None:
             with open(os.path.join(self.tmpdir.name, 'domains.list'), 'w') as list_file:
                 list_file.write('\n'.join(domains_list))
-
-        if account_key:
-            with open(os.path.join(self.tmpdir.name, 'account.key'), 'wb') as account_file:
-                account_file.write(self.account_key)
 
 
     def cleanup(self):
@@ -184,6 +198,17 @@ def check_cert_domains(path, domains):
     assert cert_domains == set(domains)
 
     return parsed_cert.fingerprint(crypto_hashes.SHA256())
+
+
+def check_account_key(path):
+    """
+    Check account key
+    """
+    with open(path, 'rb') as account_key_file:
+        account_key = account_key_file.read()
+    load_pem_private_key(account_key, None, crypto_default_backend())
+
+    return account_key
 
 
 def check_validation_server(host, port, protocols=['acme-tls/1'], hostname='_'):
@@ -248,248 +273,359 @@ def update_domains_list(path, domains_list):
 
 def test_usage(env):
     # show help
-    assert run_certs('-h')[0] == 0
+    assert run_acme_tls('-h')[0] == 0
 
     # version
-    assert run_certs('--version')[0] == 0
+    assert run_acme_tls('version')[0] == 0
 
     # run without arguments
-    assert run_certs()[0] == 2
+    assert run_acme_tls()[0] == 2
+
+
+def test_config(env):
+    # missing account directory
+    with Account() as path:
+        assert run_acme_tls('--testing', 'new-account', os.path.join(path, 'does_not_exist'))[0] == 1
+
+    # minimal config
+    with Account(env.config, env.account_key_ec) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
+
+    # comments
+    config = [
+        ' ',
+        f'acme = {pebble_url}/dir',
+        f'  host = {localhost}',
+        f'  # host = wrong_{localhost}',
+        f'port = {acme_tls_port}  # comment',
+    ]
+    with Account(config, env.account_key_ec) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
+
+    # missing config
+    with Account(None, env.account_key_ec) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 1
+
+    # syntax error
+    config = ['error']
+    with Account(config, env.account_key_ec) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 1
+
+    # unknown key
+    config = dict(env.config)
+    config['unknown_key'] = 'unknown'
+    with Account(config, env.account_key_ec) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 1
 
     # missing acme url
-    with tempfile.TemporaryDirectory() as path:
-        assert run_certs(
-            '--path', path,
-            '--host', localhost,
-            '--port', acme_tls_port,
-            '--schedule', 'once',
-        )[0] == 2
+    config = dict(env.config)
+    del config['acme']
+    with Account(config, env.account_key_ec) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 1
+
+    # missing host
+    config = dict(env.config)
+    del config['host']
+    with Account(config, env.account_key_ec) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 1
+
+    # missing port
+    config = dict(env.config)
+    del config['port']
+    with Account(config, env.account_key_ec) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 1
 
     # wrong acme ca url
-    with tempfile.TemporaryDirectory() as path:
-        assert run_certs(
-            '--path', path,
-            '--host', localhost,
-            '--port', acme_tls_port,
-            '--acme', 'wrong_url',
-            '--schedule', 'once',
-        )[0] == 2
+    config = dict(env.config)
+    config['acme'] = 'wrong_url'
+    with Account(config, env.account_key_ec) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 1
 
     # wrong schedule
-    with tempfile.TemporaryDirectory() as path:
-        assert run_certs(
-            '--path', path,
-            '--host', localhost,
-            '--port', acme_tls_port,
-            '--acme', f'{pebble_url}/dir',
-            '--schedule', '-1',
-        )[0] == 2
+    config = dict(env.config)
+    config['schedule'] = 'not_a_number'
+    with Account(config, env.account_key_ec) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 1
+
+    config = dict(env.config)
+    config['schedule'] = '666'
+    with Account(config, env.account_key_ec) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 1
+
+    # wrong port
+    config = dict(env.config)
+    config['port'] = 'not_a_number'
+    with Account(config, env.account_key_ec) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 1
+
+    config = dict(env.config)
+    config['port'] = '-666'
+    with Account(config, env.account_key_ec) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 1
 
 
-def test_failures(env):
-    domains_list = ['_']  # invalid domain
+def test_new_account(env):
+    # unreachable acme directory
+    config = dict(env.config)
+    config['acme'] = f'{pebble_wrong_url}/dir'
+    with Account(config, env.account_key_ec) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 1
 
-    # missing domain list
-    with Account() as path:
-        assert run_certs(
-            '--path', path,
-            '--host', localhost,
-            '--port', acme_tls_port,
-            '--acme', f'{pebble_url}/dir',
-            '--new-account-key',
-            '--schedule', 'once',
-            '--testing',
-        )[0] == 1
+    # wrong acme directory
+    config = dict(env.config)
+    config['acme'] = f'{pebble_url}/wrong_dir'
+    with Account(config, env.account_key_ec) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 1
 
-    # missing account key
-    with Account(domains_list) as path:
-        assert run_certs(
-            '--path', path,
-            '--host', localhost,
-            '--port', acme_tls_port,
-            '--acme', f'{pebble_url}/dir',
-            '--new-account-key',
-            '--schedule', 'once',
-            '--testing',
-        )[0] == 1
+    with Account(env.config, env.account_key_ec) as path:
+        # create new account
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
 
-    # unreachable acme ca
-    with Account(domains_list, env.account_key_ec) as path:
-        assert run_certs(
-            '--path', path,
-            '--host', localhost,
-            '--port', acme_tls_port,
-            '--acme', f'{pebble_wrong_url}/dir',
-            '--new-account-key',
-            '--schedule', 'once',
-            '--testing',
-        )[0] == 1
+        # reuse existing account
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
 
-    # wrong acme ca path
-    with Account(domains_list, env.account_key_ec) as path:
-        assert run_certs(
-            '--path', path,
-            '--host', localhost,
-            '--port', acme_tls_port,
-            '--acme', f'{pebble_url}/wrong_dir',
-            '--new-account-key',
-            '--schedule', 'once',
-            '--testing',
-        )[0] == 1
+    # create new account and generate new key
+    with Account(env.config) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
+        check_account_key(os.path.join(path, 'account.key'))
 
-    # failed validation for all domains
-    with Account(domains_list, env.account_key_ec) as path:
-        assert run_certs(
-            '--path', path,
-            '--host', localhost,
-            '--port', acme_tls_port,
-            '--acme', f'{pebble_url}/dir',
-            '--new-account-key',
-            '--schedule', 'once',
-            '--testing',
-        )[0] == 1
+
+def test_update_account(env):
+    with Account(env.config, env.account_key_ec) as path:
+        # update not existing account
+        assert run_acme_tls('--testing', 'update-account', path)[0] == 1
+
+        # create new account
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
+
+        # update existing account
+        assert run_acme_tls('--testing', 'update-account', path)[0] == 0
+
+
+def test_deactivate_account(env):
+    with Account(env.config, env.account_key_ec) as path:
+        # deactivate not existing account
+        assert run_acme_tls('--testing', 'deactivate-account', path)[0] == 1
+
+        # create new account
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
+
+        # deactivate existing account
+        assert run_acme_tls('--testing', 'deactivate-account', path)[0] == 0
+
+        # actions on deactivated account
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 1
+        assert run_acme_tls('--testing', 'update-account', path)[0] == 1
+        assert run_acme_tls('--testing', 'deactivate-account', path)[0] == 1
+
+
+def test_account_keys(env):
+    # rsa
+    with Account(env.config, env.account_key_rsa) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 1
+
+    # unsupported elliptic curves
+    with Account(env.config, env.account_key_ec_unsupported) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 1
+
+    # elliptic curves
+    with Account(env.config, env.account_key_ec) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
 
 
 def test_domains_list(env):
+    # missing domains list
+    with Account(env.config, env.account_key_ec) as path:
+        assert run_acme_tls('--testing', 'renew-all', path)[0] == 1
+
+    # empty domains list
+    domains_list = []
+    with Account(env.config, env.account_key_ec, domains_list) as path:
+        assert run_acme_tls('--testing', 'renew-all', path)[0] == 1
+
+    # invalid domain
+    domains_list = ['_']
+    with Account(env.config, env.account_key_ec, domains_list) as path:
+        assert run_acme_tls('--testing', 'renew-all', path)[0] == 1
+
+    # complex domains list
     domains_list = [
         ' # comment',
         '1.domain  # with comment',
         'domain 2.domain, 3.domain\t4.domain',
         ' ',
     ]
+    with Account(env.config, env.account_key_ec, domains_list) as path:
+        # create account
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
 
-    with Account(domains_list, env.account_key_ec) as path:
-        assert run_certs(
-            '--path', path,
-            '--host', localhost,
-            '--port', acme_tls_port,
-            '--acme', f'{pebble_url}/dir',
-            '--new-account-key',
-            '--schedule', 'once',
-            '--testing',
-        )[0] == 0
-
-        check_cert_domains(os.path.join(path, 'certificates', '1.domain', 'domain.crt'), ['1.domain'])
+        # renew all
+        assert run_acme_tls('--testing', 'renew-all', path)[0] == 0
+        check_cert_domains(
+            os.path.join(path, 'certificates', '1.domain', 'domain.crt'),
+            ['1.domain']
+        )
         check_cert_domains(
             os.path.join(path, 'certificates', 'domain', 'domain.crt'),
             'domain 2.domain 3.domain 4.domain'.split(),
         )
 
 
-def test_account_keys(env):
+def test_renew_all(env):
     domains_list = ['domain']
 
-    # rsa
-    with Account(domains_list, env.account_key_rsa) as path:
-        assert run_certs(
-            '--path', path,
-            '--host', localhost,
-            '--port', acme_tls_port,
-            '--acme', f'{pebble_url}/dir',
-            '--new-account-key',
-            '--schedule', 'once',
-            '--testing',
-        )[0] == 1
+    with Account(env.config, env.account_key_ec, domains_list) as path:
+        # renew all without an account
+        assert run_acme_tls('--testing', 'renew-all', path)[0] == 1
+        assert not os.path.exists(os.path.join(path, 'certificates', 'domain', 'domain.crt'))
 
-    # unsupported elliptic curves
-    with Account(domains_list, env.account_key_ec_unsupported) as path:
-        assert run_certs(
-            '--path', path,
-            '--host', localhost,
-            '--port', acme_tls_port,
-            '--acme', f'{pebble_url}/dir',
-            '--new-account-key',
-            '--schedule', 'once',
-            '--testing',
-        )[0] == 1
+        # create account
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
 
-    # elliptic curves
-    with Account(domains_list, env.account_key_ec) as path:
-        assert run_certs(
-            '--path', path,
-            '--host', localhost,
-            '--port', acme_tls_port,
-            '--acme', f'{pebble_url}/dir',
-            '--new-account-key',
-            '--schedule', 'once',
-            '--testing',
-        )[0] == 0
-        check_cert_domains(os.path.join(path, 'certificates', 'domain', 'domain.crt'), ['domain'])
+        # renew all
+        assert run_acme_tls('--testing', 'renew-all', path)[0] == 0
+        domain_fprint = check_cert_domains(os.path.join(path, 'certificates', 'domain', 'domain.crt'), ['domain'])
+
+        # already renewed
+        assert run_acme_tls('--testing', 'renew-all', path)[0] == 0
+        assert domain_fprint == check_cert_domains(os.path.join(path, 'certificates', 'domain', 'domain.crt'), ['domain'])
+
+        # force renewal
+        assert run_acme_tls('--testing', 'renew-all', path, '--force')[0] == 0
+        assert domain_fprint != check_cert_domains(os.path.join(path, 'certificates', 'domain', 'domain.crt'), ['domain'])
 
 
-def test_run(env):
-    domains_list = ['domain']
+def test_renew_domain(env):
+    domains_list = ['domain', 'ignored']
 
-    def run(path):
-        assert run_certs(
-            '--path', path,
-            '--host', localhost,
-            '--port', acme_tls_port,
-            '--acme', f'{pebble_url}/dir',
-            '--new-account-key',
-            '--schedule', 'once',
-            '--testing',
-        )[0] == 0
-        check_cert_domains(os.path.join(path, 'certificates', 'domain', 'domain.crt'), ['domain'])
+    with Account(env.config, env.account_key_ec, domains_list) as path:
+        # missing domain argument
+        assert run_acme_tls('--testing', 'renew', path)[0] == 2
 
-    def run_force(path):
-        assert run_certs(
-            '--path', path,
-            '--host', localhost,
-            '--port', acme_tls_port,
-            '--acme', f'{pebble_url}/dir',
-            '--new-account-key',
-            '--schedule', 'force',
-            '--testing',
-        )[0] == 0
-        check_cert_domains(os.path.join(path, 'certificates', 'domain', 'domain.crt'), ['domain'])
+        # renew without an account
+        assert run_acme_tls('--testing', 'renew', path, '--domain', 'domain')[0] == 1
+        assert not os.path.exists(os.path.join(path, 'certificates', 'domain', 'domain.crt'))
 
-    # run
-    with Account(domains_list) as path:
-        run(path)
-        run(path)
+        # create account
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
 
-    # run force
-    with Account(domains_list) as path:
-        run_force(path)
-        run_force(path)
+        # renew
+        assert run_acme_tls('--testing', 'renew', path, '--domain', 'domain')[0] == 0
+        domain_fprint = check_cert_domains(os.path.join(path, 'certificates', 'domain', 'domain.crt'), ['domain'])
+        assert not os.path.exists(os.path.join(path, 'certificates', 'ignored', 'ignored.crt'))
+
+        # already renewed
+        assert run_acme_tls('--testing', 'renew', path, '--domain', 'domain')[0] == 0
+        assert domain_fprint == check_cert_domains(os.path.join(path, 'certificates', 'domain', 'domain.crt'), ['domain'])
+        assert not os.path.exists(os.path.join(path, 'certificates', 'ignored', 'ignored.crt'))
+
+        # force renewal
+        assert run_acme_tls('--testing', 'renew', path, '--force', '--domain', 'domain')[0] == 0
+        assert domain_fprint != check_cert_domains(os.path.join(path, 'certificates', 'domain', 'domain.crt'), ['domain'])
+        assert not os.path.exists(os.path.join(path, 'certificates', 'ignored', 'ignored.crt'))
+
+
+def test_revoke_all(env):
+    domains_list = ['domain1', 'domain2']
+
+    with Account(env.config, env.account_key_ec, domains_list) as path:
+        # revoke without account
+        assert run_acme_tls('--testing', 'revoke-all', path)[0] == 1
+
+        # create an account
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
+
+        # get cerfitifcates
+        assert run_acme_tls('--testing', 'renew', path, '--domain', 'domain1')[0] == 0
+
+        # revoke all (only domain1 will be revoked)
+        assert run_acme_tls('--testing', 'revoke-all', path)[0] == 1
+
+        # get all cerfitifcates
+        assert run_acme_tls('--testing', 'renew-all', path)[0] == 0
+
+        # revoke all
+        assert run_acme_tls('--testing', 'revoke-all', path)[0] == 1
+
+    with Account(env.config, None, domains_list) as path:
+        # create an account
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
+        check_account_key(os.path.join(path, 'account.key'))
+
+        # get all cerfitifcates
+        assert run_acme_tls('--testing', 'renew-all', path)[0] == 0
+
+        # revoke all
+        assert run_acme_tls('--testing', 'revoke-all', path)[0] == 0
+
+
+def test_revoke_domain(env):
+    domains_list = ['domain', 'ignored']
+
+    with Account(env.config, env.account_key_ec, domains_list) as path:
+        # missing domain argument
+        assert run_acme_tls('--testing', 'revoke', path)[0] == 2
+
+        # create an account
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
+
+        # renew
+        assert run_acme_tls('--testing', 'renew', path, '--domain', 'domain')[0] == 0
+        domain_fprint = check_cert_domains(os.path.join(path, 'certificates', 'domain', 'domain.crt'), ['domain'])
+
+        # revoke
+        assert run_acme_tls('--testing', 'revoke', path, '--domain', 'domain')[0] == 0
+
+        # revoke again
+        assert run_acme_tls('--testing', 'revoke', path, '--domain', 'domain')[0] == 1
+
+        # renew again
+        assert run_acme_tls('--testing', 'renew', path, '--force', '--domain', 'domain')[0] == 0
+        assert domain_fprint != check_cert_domains(os.path.join(path, 'certificates', 'domain', 'domain.crt'), ['domain'])
+
+        # revoke
+        assert run_acme_tls('--testing', 'revoke', path, '--domain', 'domain')[0] == 0
 
 
 def test_contact(env):
     domains_list = ['domain']
 
-    with Account(domains_list) as path:
-        assert run_certs(
-            '--path', path,
-            '--host', localhost,
-            '--port', acme_tls_port,
-            '--acme', f'{pebble_url}/dir',
-            '--schedule', 'force',
-            '--new-account-key',
-            '--contact', 'mailto:a@b.c',
-            '--contact', 'mailto:d@e.f',
-            '--testing',
-        )[0] == 0
-        check_cert_domains(os.path.join(path, 'certificates', 'domain', 'domain.crt'), ['domain'])
+    config = dict(env.config)
+    config['contact'] = 'mailto:a@b.c'
+    with Account(config, env.account_key_ec, domains_list) as path:
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
+
+
+def test_group(env):
+    domains_list = ['domain']
+
+    config = dict(env.config)
+    config['group'] = 'www-data'  # user needs to be in this group
+    with Account(config, env.account_key_ec, domains_list) as path:
+        # create an account
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
+
+        # renew all
+        assert run_acme_tls('--testing', 'renew-all', path)[0] == 0
+        domain_cert = os.path.join(path, 'certificates', 'domain', 'domain.crt')
+        check_cert_domains(domain_cert, ['domain'])
+        stat = os.stat(domain_cert)
+        gid = stat.st_gid
+        assert config['group'] == grp.getgrgid(gid)[0]
 
 
 def test_removals(env):
     domains_list = ['domain']
 
     def run(path):
-        assert run_certs(
-            '--path', path,
-            '--host', localhost,
-            '--port', acme_tls_port,
-            '--acme', f'{pebble_url}/dir',
-            '--new-account-key',
-            '--schedule', 'force',
-            '--testing',
-        )[0] == 0
+        assert run_acme_tls('--testing', 'renew-all', path)[0] == 0
         check_cert_domains(os.path.join(path, 'certificates', 'domain', 'domain.crt'), ['domain'])
 
     # removing fallbacks
-    with Account(domains_list) as path:
+    with Account(env.config, None, domains_list) as path:
+        # create an account
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
+
         run(path)
         os.unlink(os.path.join(path, 'fallback.key'))
         run(path)
@@ -500,7 +636,11 @@ def test_removals(env):
         run(path)
 
     # removing domain certificates
-    with Account(domains_list) as path:
+    with Account(env.config, None, domains_list) as path:
+        # create an account
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
+        check_account_key(os.path.join(path, 'account.key'))
+
         run(path)
         os.unlink(os.path.join(path, 'certificates', 'domain', 'domain.key'))
         run(path)
@@ -512,20 +652,19 @@ def test_removals(env):
 
 
 def test_validation_server(env):
+    # run validation server without an account
+    with Account(env.config, None, ['domain']) as path:
+        assert run_acme_tls('--testing', 'run', path)[0] == 1
+
     try:
-        account = Account(['domain1'])
+        account = Account(env.config, env.account_key_ec, ['domain1'])
         path = account.tmpdir.name
 
+        # create an account
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
+
         # run validation server
-        process = run_certs(
-            '--path', path,
-            '--host', localhost,
-            '--port', acme_tls_port,
-            '--acme', f'{pebble_url}/dir',
-            '--new-account-key',
-            '--testing',
-            wait=False,
-        )
+        process = run_acme_tls('--testing', 'run', path, wait=False)
 
         # wait for server to come up
         wait_for_validation_server()
@@ -570,22 +709,22 @@ def test_validation_server(env):
 
 def test_done_command(env):
     try:
-        account = Account(['domain1'])
+        # prepare account dir
+        done_file_name_1 = '.ready_file1'
+        done_file_name_2 = '.ready_file2'
+
+        config = dict(env.config)
+        config['done_cmd'] = f'echo -n "file1" | cat > "{done_file_name_1}" && echo -n "file2" | cat > "{done_file_name_2}"'
+        account = Account(config, env.account_key_ec, ['domain1'])
         path = account.tmpdir.name
-        done_file_name_1 = os.path.join(path, '.ready_file1')
-        done_file_name_2 = os.path.join(path, '.ready_file2')
+        done_file_name_1 = os.path.join(path, done_file_name_1)
+        done_file_name_2 = os.path.join(path, done_file_name_2)
+
+        # create an account
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
 
         # run validation server
-        process = run_certs(
-            '--path', path,
-            '--host', localhost,
-            '--port', acme_tls_port,
-            '--acme', f'{pebble_url}/dir',
-            '--new-account-key',
-            '--done-cmd', f'echo -n "file1" | cat > "{done_file_name_1}" && echo -n "file2" | cat > "{done_file_name_2}"',
-            '--testing',
-            wait=False,
-        )
+        process = run_acme_tls('--testing', 'run', path, wait=False)
 
         # wait for server to come up
         wait_for_validation_server()
@@ -642,7 +781,7 @@ def test_done_command(env):
 
         # done cmd should not run
         process.send_signal(signal.SIGHUP)
-        time.sleep(3)  # to to complete certificate validity checks
+        time.sleep(3)  # to to complete certificate validation checks
         assert domain1_fprint == wait_for_domain_cert(path, 'domain1')
         assert domain2_fprint == wait_for_domain_cert(path, 'domain2')
         assert domain3_fprint == wait_for_domain_cert(path, 'domain3')
@@ -659,6 +798,35 @@ def test_done_command(env):
             # check that last done comman was not run
             assert stdout.split('\n')[-2] == 'watchdog: no new certificates were issued, not running done callback\n'
 
+            print(stdout)
+        except Exception:
+            pass
+        account.cleanup()
+
+
+def test_port_conflict(env):
+    try:
+        account = Account(env.config, env.account_key_ec, ['domain'])
+        path = account.tmpdir.name
+
+        # create an account
+        assert run_acme_tls('--testing', 'new-account', path)[0] == 0
+
+        # run validation server
+        process = run_acme_tls('--testing', 'run', path, wait=False)
+
+        # wait for server to come up
+        wait_for_validation_server()
+
+        # renew certificates
+        assert run_acme_tls('--testing', 'renew-all', path)[0] == 0
+        check_cert_domains(os.path.join(path, 'certificates', 'domain', 'domain.crt'), ['domain'])
+    finally:
+        # cleanup
+        try:
+            process.send_signal(signal.SIGINT)
+            stdout, _ = process.communicate(timeout=5)
+            stdout = stdout.decode('utf8')
             print(stdout)
         except Exception:
             pass

@@ -1,28 +1,44 @@
 #!/usr/bin/env python3
 """
-acme-tls creates and validates domain certificates using ACME tls-alpn-01 challenge.
-acme-tls checks domain certificates once a day at 4am, accepting validation challenges
-on ::1 port 7443, by default. It reloads configuration with certificates recheck
-on HUP signal. Use reverse proxy (nginx, apache, ...) for routing https traffic
-to either your https server or acme-tls. Supported crypto is elliptic curve secp384r1.
+acme-tls obtains and automatically renews domain certificates using acme tls-alpn-01 protocol and elliptic curve cryptography.
 
-Quick start:
- 1. create account directory to store account key and certificates
- 2. create account/domains.list with domains and their subdomains on each line
- 3. setup reverse proxy to redirect tls-alpn-01 challenges to acme-tls validation server
- 4. create account key and run validation server with (assuming letsencrypt as CA)
-    acme-tls.py --path account --acme letsencrypt --new-account-key --schedule once
- 5. check if certificates were generated correctly, run validation server (assuming nginx proxy)
-    acme-tls.py --path account --acme letsencrypt --done-cmd 'sudo systemctl reload nginx'
+usage:
+  acme-tls new-account account_path
+  acme-tls update-account account_path
+  acme-tls deactivate-account account_path
+  acme-tls run account_path
+  acme-tls renew account_path --domain domain ... [--force]
+  acme-tls renew-all account_path [--force]
+  acme-tls revoke account_path --domain domain ...
+  acme-tls revoke-all account_path
+  acme-tls version
 
-Example domains.list configuration:
+  all commands accept --help to show detailed usage information
 
-example.org
-example.net
-example.com, subdomain.example.com  # create multidomain certificate
+quick guide:
+  mkdir account_path
+  cat > account_path/config         # paste configuration
+  cat > account_path/domains.list   # paste domains
+  acme-tls new-account account_path # create new account
+  acme-tls run account_path         # obtain certificates, monitor and renew if necessary
+  # domain certificates are stored in acount/certificates
 
-Author: Jan Prochazka
-License: none, public domain
+example account/config:
+  acme = letsencrypt  # acme certificate authority, i.e. letsencrypt,
+                      # letsencrypt_test or acme directory url
+  contact =     # contact information for certificate authority, i.e. user@example.org, optional
+  host = ::1    # validation server hostname
+  port = 7443   # validation server port
+  group =       # user group for generated certificates, i.e. www-data, optional
+  schedule = 4  # hour which acme-tls tries to check and renew domain certificates, optional
+  done_cmd =    # command to be run after successful batch with new domain certificates, optional
+
+example account/domain.list:
+  example.org
+  example.net subdomain.example.net another.example.net  # multidomain certificate
+
+author: Jan Prochazka
+license: none, public domain
 """
 """
 acme-tls return values
@@ -52,6 +68,7 @@ import traceback
 import random
 import grp
 import textwrap
+import errno
 from datetime import datetime, timedelta
 from threading import Event
 from multiprocessing import Process, Queue
@@ -72,7 +89,7 @@ class cfg:
     # prepared acme directory urls
     acme_directories = {
         'letsencrypt': 'https://acme-v02.api.letsencrypt.org/directory',
-        'letsencrypt_staging': 'https://acme-staging-v02.api.letsencrypt.org/directory',
+        'letsencrypt_test': 'https://acme-staging-v02.api.letsencrypt.org/directory',
     }
 
     # certificate expiration times in days
@@ -95,10 +112,10 @@ class cfg:
     domains_list_name = 'domains.list'
     certificates_path = 'certificates'
     challenges_path = 'challenges'
-    check_file = '.check'
 
-    # domain separators
+    # domain regexes
     domain_separator = re.compile(r'[ ,\t]')
+    domain_validation = re.compile(r'^[-a-z0-9]{1,63}(\.[-a-z0-9]{1,63}){,8}$', re.I)
 
     # invalid SNI, used for watchdog check
     invalid_sni = '_'
@@ -242,7 +259,7 @@ def generate_fallback_certificates(fallback_key, fallback_cert):
         '-out', fallback_cert,
         '-days', str(cfg.temporary_certs_expiration),
         '-subj', '/',
-    ], err_msg='server: cannot create fallback certificate')
+    ], err_msg='cannot create fallback certificate')
     os.chmod(fallback_key, 0o400)
     os.chmod(fallback_cert, 0o400)
 
@@ -291,7 +308,7 @@ class ValidationHandler(socketserver.BaseRequestHandler):
 
         # check SNI validity
         print(f'server: certificate request from {self.client_address[0]} for {sni_name}')
-        if not re.match(r'^[-a-z0-9]{1,63}(\.[-a-z0-9]{1,63}){,3}$', sni_name, re.I):
+        if cfg.domain_validation.match(sni_name) is None:
             print('server: invalid sni name')
             return
 
@@ -323,10 +340,13 @@ class ValidationHandler(socketserver.BaseRequestHandler):
                 print(f'server: {exc}')
 
 
-def run_server(account_path, host, port, group, event_queue):
+def run_server(account_path, config, event_queue):
     """
     Run tls server for validation challenges
     """
+    host = config['host']
+    port = config['port']
+
     server = None
     try:
         fallback_key = os.path.join(account_path, cfg.fallback_key)
@@ -346,12 +366,17 @@ def run_server(account_path, host, port, group, event_queue):
         }
 
         # run challenge server
-        print(f'server: running challenge server on {host} port {port}')
+        print(f'server: running validation server on {host} port {port}')
         server.serve_forever()
-    except Exception:
-        traceback.print_exc()
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            print(f'server: address {host} port {port} is already in use, quitting')
+        else:
+            traceback.print_exc()
     except RuntimeError as exc:
         print(f'server: {exc}')
+    except Exception:
+        traceback.print_exc()
     except KeyboardInterrupt:
         print('server: exiting on user request', file=sys.stderr)
     finally:
@@ -397,7 +422,7 @@ def send_request(url, data=None, err_msg='cannot send request', validate=True, c
     return response_data, code, headers
 
 
-def send_signed_request(url, payload, nonce_url, account_info, err_msg, validate=True):
+def send_signed_request(url, payload, account_info, err_msg, validate=True):
     """
     Make signed request
     """
@@ -411,7 +436,7 @@ def send_signed_request(url, payload, nonce_url, account_info, err_msg, validate
     account_id = account_info['id']
     while attempts < max_attempts:
         # get new nonce
-        new_nonce = send_request(nonce_url, validate=validate)[2]['Replay-Nonce']
+        new_nonce = send_request(account_info['acme_directory']['newNonce'], validate=validate)[2]['Replay-Nonce']
 
         # create jws header
         header = {
@@ -425,21 +450,22 @@ def send_signed_request(url, payload, nonce_url, account_info, err_msg, validate
         # sign header and payload
         protected_input = f'{header_b64}.{payload_b64}'.encode('utf8')
         der_signature = run_cmd(
-            ['openssl', 'dgst', '-sha384', '-sign', account_info['path']],
+            ['openssl', 'dgst', '-sha384', '-sign', account_info['account_key_path']],
             cmd_input=protected_input,
             err_msg=f'{err_msg}: cannot sign a request',
             )
 
         # parse DER signature
         # https://crypto.stackexchange.com/questions/1795/how-can-i-convert-a-der-ecdsa-signature-to-asn-1/1797#1797
+        key_size = account_info['account_key_size']
         roffset = 4
         rsize = der_signature[3]
         soffset = roffset + rsize + 2
         ssize = der_signature[soffset - 1]
         r = der_signature[roffset:roffset + rsize]
         s = der_signature[soffset:soffset + ssize]
-        r = (48 * b'\x00' + r)[-48:]
-        s = (48 * b'\x00' + s)[-48:]
+        r = (key_size * b'\x00' + r)[-key_size:]
+        s = (key_size * b'\x00' + s)[-key_size:]
         signature = r + s
 
         jws_json = json.dumps({
@@ -463,7 +489,7 @@ def send_signed_request(url, payload, nonce_url, account_info, err_msg, validate
     raise RuntimeError(f'{err_msg}: too may failed request attempts')
 
 
-def wait_for_completion(url, pending_statuses, nonce_url, account_info, err_msg, validate=True):
+def wait_for_completion(url, pending_statuses, account_info, err_msg, validate=True):
     """
     Wait for task completion
     """
@@ -482,7 +508,6 @@ def wait_for_completion(url, pending_statuses, nonce_url, account_info, err_msg,
         result, _, _ = send_signed_request(
             url,
             None,
-            nonce_url,
             account_info,
             err_msg,
             validate,
@@ -491,10 +516,13 @@ def wait_for_completion(url, pending_statuses, nonce_url, account_info, err_msg,
     return result
 
 
-def get_certificate(acme_directory, account_path, account_info, domains, group, renew, openssl_config, testing):
+def get_certificate(account_path, config, account_info, domains, renew, openssl_config, testing):
     """
     Get certificates through ACME process
     """
+    acme_directory = account_info['acme_directory']
+    group = config.get('group')
+
     print(f'getting certificate for {", ".join(domains)}')
     validate_acme = testing is None
 
@@ -559,7 +587,6 @@ def get_certificate(acme_directory, account_path, account_info, domains, group, 
     order, _, order_headers = send_signed_request(
         acme_directory['newOrder'],
         order_payload,
-        acme_directory['newNonce'],
         account_info,
         f'cannot create new order for {main_domain} at {acme_directory["newOrder"]}',
         validate_acme,
@@ -571,7 +598,6 @@ def get_certificate(acme_directory, account_path, account_info, domains, group, 
         authorization, _, _ = send_signed_request(
             auth_url,
             None,
-            acme_directory['newNonce'],
             account_info,
             f'cannot get validation challenges for {main_domain} at {auth_url}',
             validate_acme,
@@ -673,7 +699,6 @@ def get_certificate(acme_directory, account_path, account_info, domains, group, 
                 send_signed_request(
                     challenge['url'],
                     {},
-                    acme_directory['newNonce'],
                     account_info,
                     f'cannot submit validation challenge for {domain} at {challenge["url"],}',
                     validate_acme,
@@ -683,7 +708,6 @@ def get_certificate(acme_directory, account_path, account_info, domains, group, 
                 authorization = wait_for_completion(
                     auth_url,
                     ['pending'],
-                    acme_directory['newNonce'],
                     account_info,
                     f'cannot check challenge status for {domain} at {auth_url}',
                     validate_acme,
@@ -722,7 +746,6 @@ def get_certificate(acme_directory, account_path, account_info, domains, group, 
     send_signed_request(
         order['finalize'],
         {'csr': b64(domain_csr_der)},
-        acme_directory['newNonce'],
         account_info,
         f'cannot finalize order for {main_domain} at {order["finalize"]}',
         validate_acme,
@@ -732,7 +755,6 @@ def get_certificate(acme_directory, account_path, account_info, domains, group, 
     order = wait_for_completion(
         order_headers['Location'],
         ['pending', 'processing'],
-        acme_directory['newNonce'],
         account_info,
         f'cannot check order status for {main_domain} at {order_headers["Location"]}',
         validate_acme,
@@ -745,7 +767,6 @@ def get_certificate(acme_directory, account_path, account_info, domains, group, 
     domain_cert, _, _ = send_signed_request(
         order['certificate'],
         None,
-        acme_directory['newNonce'],
         account_info,
         f'cannot download certificate for {main_domain} from {order["certificate"]}',
         validate_acme,
@@ -771,7 +792,7 @@ def get_certificate(acme_directory, account_path, account_info, domains, group, 
     return True  # new certificate was issued
 
 
-def run_validation(account_path, acme_url, domains, contact, group, renew, event_queue, testing):
+def run_validation(account_path, config, domains, renew, event_queue, testing):
     """
     Run complete certificate retrieval for one account
     """
@@ -779,7 +800,6 @@ def run_validation(account_path, acme_url, domains, contact, group, renew, event
         print('validation started')
         validated = 0
         issued = 0
-        validate_acme = testing is None
 
         # get openssl config for validation certificate
         openssl_info = run_cmd(
@@ -791,88 +811,17 @@ def run_validation(account_path, acme_url, domains, contact, group, renew, event
         with open(openssl_config_file_name) as openssl_config_file:
             openssl_config = openssl_config_file.read()
 
-        print('parsing account key')
-        account_key_path = os.path.join(account_path, cfg.account_key_name)
-
-        # check ec certificate
-        cert_header = b'-----BEGIN EC PRIVATE KEY-----'
-        with open(account_key_path, 'rb') as account_key_file:
-            file_header = account_key_file.read(len(cert_header))
-        if file_header != cert_header:
-            raise RuntimeError(f'expecting account key as elliptic curve private key in {account_key_path}')
-
-        # parse account key
-        key_info = run_cmd([
-            'openssl', 'ec', '-in', account_key_path, '-noout', '-text'
-        ], err_msg=f'cannot parse account key in {account_key_path}').decode('utf8')
-        serialized_key = re.search(r'pub:\n((?:\s+[:0-9a-f]+\n)+)', key_info, re.I).group(1)
-        serialized_key = binascii.unhexlify(re.sub(r'[:\s]', '', serialized_key))
-        compression = serialized_key[0]
-        if compression != 4:
-            raise RuntimeError('only uncompressed public key is supported, found compressed one in {account_key_path}')
-        public_key = serialized_key[1:]
-        curve_name = re.search(r'ASN1 OID: (\w+)', key_info).group(1)
-        if curve_name != cfg.ec_curve:
-            raise RuntimeError(f'only {cfg.ec_curve} is supported, found {curve_name} in {account_key_path}')
-        x = public_key[:48]
-        y = public_key[48:]
-
-        # create jwk and signing information
-        jwk = {
-            'kty': 'EC',
-            'crv': 'P-384',
-            'x': b64(x),
-            'y': b64(y),
-        }
-        key = json.dumps(jwk, sort_keys=True, separators=(',', ':'))
-        account_info = {
-            'alg': 'ES384',
-            'jwk': jwk,
-            'path': account_key_path,
-            'thumbprint': b64(hashlib.sha256(key.encode('utf8')).digest()),
-        }
-
-        # get the ACME directory of urls
-        print('getting ACME directory')
-        acme_directory, _, _ = send_request(acme_url, err_msg=f'cannot fetch acme directory url {acme_url}', validate=validate_acme)
-
-        # create account
-        print('registering account')
-        register_payload = {'termsOfServiceAgreed': True}
-        account_info['id'] = None
-        _, code, headers = send_signed_request(
-            acme_directory['newAccount'],
-            register_payload,
-            acme_directory['newNonce'],
-            account_info,
-            f'cannot register account at {acme_directory["newAccount"]}',
-            validate_acme,
-        )
-        account_info['id'] = headers['Location']
-        print('{} account id: {}'.format('registered' if code == 201 else 'already registered', account_info['id']))
-
-        # update account contact
-        if contact:
-            update_payload = {'contact': contact}
-            account, _, _ = send_signed_request(
-                account_info['id'],
-                update_payload,
-                acme_directory['newNonce'],
-                account_info,
-                f'cannot update account contact details at {account_info["id"]}',
-                validate_acme,
-            )
-            print(f'updated contact details with {", ".join(account["contact"])}')
+        # connect to account
+        account_info = connect_account(account_path, config, True, testing)
 
         # get certificates
         for domain_names in domains:
             try:
                 issued += int(get_certificate(
-                    acme_directory,
                     account_path,
+                    config,
                     account_info,
                     domain_names,
-                    group,
                     renew,
                     openssl_config,
                     testing,
@@ -924,20 +873,23 @@ def next_schedule(hour):
         return None
 
 
-def event_listener(queue, done_cmd):
+def event_listener(account_path, config, queue):
     """
     Listen to applicaition events
     """
+    done_cmd = config.get('done_cmd')
+
     while True:
         event, data = queue.get()
         if event == 'validation_done':
             # run done command
-            issued = data
             if done_cmd:
+                issued = data
                 if issued > 0:
                     print(f'watchdog: running user command: {done_cmd}')
                     try:
-                        subprocess.run(done_cmd, shell=True)
+                        sys.stdout.flush()
+                        subprocess.run(done_cmd, cwd=account_path, shell=True)
                     except Exception:
                         print('watchdog: cannot run user command: {done_cmd}')
                         traceback.print_exc()
@@ -952,17 +904,8 @@ def check_account_path(path):
     """
     Initial account directory check
     """
-    try:
-        check_file_name = os.path.join(path, cfg.check_file)
-        with open(check_file_name, 'wb') as check_file:
-            check_file.write(b'ok')
-    except Exception as exc:
-        raise CheckError(f'cannot access {path} for writing, aborting: {exc}')
-    finally:
-        try:
-            os.unlink(check_file_name)
-        except:
-            pass  # nothing more to do about it
+    if not os.path.isdir(path):
+        raise CheckError(f'account directory {path} does not exist')
 
 
 def check_account_key(path, create):
@@ -988,19 +931,19 @@ def check_account_key(path, create):
                 os.fchmod(account_key_file.fileno(), 0o400)
             print(f'watchdog: new account key saved to {path}')
         else:
-            raise CheckError(f'account key not found at {path}, quitting')
+            raise CheckError(f'account key not found at {path}')
     except Exception as exc:
-        raise CheckError(f'cannot open account key at {path}, quitting: {exc}')
+        raise CheckError(f'cannot open account key at {path}: {exc}')
 
 
-def check_domains_list(path):
+def read_domains_list(path):
     """
-    Initial domain list check
+    Read domains list
     """
     try:
         domains = []
         with open(path) as domains_file:
-            for line in domains_file:
+            for line_number, line in enumerate(domains_file, 1):
                 line = line.strip()
 
                 # ignore comments
@@ -1015,6 +958,8 @@ def check_domains_list(path):
                         continue
                     if name.startswith('#'):
                         break
+                    if cfg.domain_validation.match(name) is None:
+                        raise CheckError(f'domain name {name} is invalid, found at {path}:{line_number}')
                     domain_names.append(name)
 
                 # add domains to the list
@@ -1024,7 +969,7 @@ def check_domains_list(path):
         if not domains:
             raise CheckError('domains list is empty, add at least one domain')
 
-        print('watchdog: found domains')
+        print('found domains')
         for names in domains:
             print(f'  {", ".join(names)}')
 
@@ -1033,10 +978,143 @@ def check_domains_list(path):
         raise CheckError(f'cannot find domains list at {path}')
 
 
-def run_watchdog(args):
+def connect_account(account_path, config, existing_only, testing):
+    """
+    Log in to account, return account information
+    """
+    acme_url = config['acme']
+    contact = config.get('contact')
+    validate_acme = testing is None
+
+    print('parsing account key')
+    account_key_path = os.path.join(account_path, cfg.account_key_name)
+
+    # check ec certificate
+    cert_header = b'-----BEGIN EC PRIVATE KEY-----'
+    with open(account_key_path, 'rb') as account_key_file:
+        file_header = account_key_file.read(len(cert_header))
+    if file_header != cert_header:
+        raise RuntimeError(f'expecting account key as elliptic curve private key in {account_key_path}')
+
+    # parse account key
+    key_info = run_cmd([
+        'openssl', 'ec', '-in', account_key_path, '-noout', '-text'
+    ], err_msg=f'cannot parse account key in {account_key_path}').decode('utf8')
+    serialized_key = re.search(r'pub:\n((?:\s+[:0-9a-f]+\n)+)', key_info, re.I).group(1)
+    serialized_key = binascii.unhexlify(re.sub(r'[:\s]', '', serialized_key))
+    compression = serialized_key[0]
+    if compression != 4:
+        raise RuntimeError('only uncompressed public key is supported, found compressed one in {account_key_path}')
+    public_key = serialized_key[1:]
+    curve_name = re.search(r'ASN1 OID: (\w+)', key_info).group(1)
+    if curve_name != cfg.ec_curve:
+        raise RuntimeError(f'only {cfg.ec_curve} is supported, found {curve_name} in {account_key_path}')
+    key_size = 384 // 8  # secp384r1
+    x = public_key[:key_size]
+    y = public_key[key_size:]
+
+    # create jwk and signing information
+    jwk = {
+        'kty': 'EC',
+        'crv': 'P-384',
+        'x': b64(x),
+        'y': b64(y),
+    }
+    key = json.dumps(jwk, sort_keys=True, separators=(',', ':'))
+    account_info = {
+        'alg': 'ES384',
+        'jwk': jwk,
+        'thumbprint': b64(hashlib.sha256(key.encode('utf8')).digest()),
+        'account_key_path': account_key_path,
+        'account_key_size': key_size,
+    }
+
+    # get the ACME directory of urls
+    print('getting ACME directory')
+    acme_directory, _, _ = send_request(acme_url, err_msg=f'cannot fetch acme directory url {acme_url}', validate=validate_acme)
+    account_info['acme_directory'] = acme_directory
+
+    # create account
+    print('registering account')
+    register_payload = {
+        'onlyReturnExisting': existing_only,
+        'termsOfServiceAgreed': True,
+    }
+    account_info['id'] = None
+    _, code, headers = send_signed_request(
+        acme_directory['newAccount'],
+        register_payload,
+        account_info,
+        f'cannot register account at {acme_directory["newAccount"]}',
+        validate_acme,
+    )
+    account_info['id'] = headers['Location']
+    print('{} account id: {}'.format('registered' if code == 201 else 'already registered', account_info['id']))
+
+    # update account contact
+    if contact is not None:
+        update_payload = {'contact': contact}
+        account, _, _ = send_signed_request(
+            account_info['id'],
+            update_payload,
+            account_info,
+            f'cannot update account contact details at {account_info["id"]}',
+            validate_acme,
+        )
+        print(f'updated contact details with {", ".join(account["contact"])}')
+
+    return account_info
+
+
+def run_new_account(account_path, config, testing):
+    """
+    Create new acme account
+    """
+    check_account_key(os.path.join(account_path, cfg.account_key_name), create=True)
+    connect_account(account_path, config, False, testing)
+    return 0
+
+
+def run_update_account(account_path, config, testing):
+    """
+    Update acme account
+    """
+    check_account_key(os.path.join(account_path, cfg.account_key_name), create=False)
+    connect_account(account_path, config, True, testing)
+    return 0
+
+
+def run_deactivate_account(account_path, config, testing):
+    """
+    Deactivate acme acccount
+    """
+    validate_acme = not testing
+
+    # connect to account
+    check_account_key(os.path.join(account_path, cfg.account_key_name), create=False)
+    account_info = connect_account(account_path, config, True, testing)
+
+    # deactivate account
+    deactivate_payload = {'status': 'deactivated'}
+    account, _, _ = send_signed_request(
+        account_info['id'],
+        deactivate_payload,
+        account_info,
+        f'cannot deactivate account at {account_info["id"]}',
+        validate_acme,
+    )
+    print(f'account {account_info["id"]} is deactivated')
+    return 0
+
+
+def run_watchdog(account_path, config, domains_list, schedule_once, testing):
     """
     Run watchdog
     """
+    server_host = config['host']
+    server_port  = config['port']
+    schedule  = config.get('schedule') if schedule_once is None else schedule_once
+
     # setup signaling
     hup_event = Event()
     signal.signal(signal.SIGHUP, lambda sig, frame: hup_event.set())
@@ -1045,23 +1123,15 @@ def run_watchdog(args):
     server_pid = None
     validation_pid = None
     try:
-        # check account directory
-        print('watchdog: checking account directory')
-        check_account_path(args.path)
-        domains = check_domains_list(os.path.join(args.path, cfg.domains_list_name))
-        check_account_key(os.path.join(args.path, cfg.account_key_name), args.new_account_key)
-
         # run thread listening for events
         event_queue = Queue()
-        event_thread = threading.Thread(target=event_listener, args=(event_queue, args.done_cmd), daemon=True)
+        event_thread = threading.Thread(target=event_listener, args=(account_path, config, event_queue), daemon=True)
         event_thread.start()
 
         print('watchdog: starting validation server')
         server_process = Process(target=run_server, args=(
-            args.path,
-            args.host,
-            args.port,
-            args.group,
+            account_path,
+            config,
             event_queue,
         ), daemon=True)
         server_process.start()
@@ -1071,7 +1141,7 @@ def run_watchdog(args):
         check_attempts = 5
         while check_attempts > 0:
             try:
-                check_server(args.host, args.port)
+                check_server(server_host, server_port)
                 break
             except CheckError as exc:
                 check_attempts -= 1
@@ -1082,10 +1152,10 @@ def run_watchdog(args):
         first_schedule = True
         while True:
             # compute next schedule
-            if args.schedule in ('once', 'force') and first_schedule:
+            if schedule in ('once', 'force') and first_schedule:
                 scheduled = datetime.now().replace(microsecond=0) - timedelta(days=1)
             else:  # can miss schedule on hup, certs have been renewed anyway
-                scheduled = next_schedule(args.schedule)
+                scheduled = next_schedule(schedule)
             first_schedule = False
 
             # wait for schedule
@@ -1098,7 +1168,7 @@ def run_watchdog(args):
                 # check server
                 if server_pid is not None:
                     try:
-                        check_server(args.host, args.port)
+                        check_server(server_host, server_port)
                     except CheckError as exc:
                         print(f'watchdog: cannot reach server, stopping it: {exc}')
                         safe_kill(server_pid)
@@ -1106,12 +1176,10 @@ def run_watchdog(args):
 
                 # run server if not running
                 if server_pid is None or not check_pid(server_pid):
-                    print('watchdog: starting server')
+                    print('watchdog: starting validation server')
                     server_process = Process(target=run_server, args=(
-                        args.path,
-                        args.host,
-                        args.port,
-                        args.group,
+                        account_path,
+                        config,
                         event_queue,
                     ), daemon=True)
                     server_process.start()
@@ -1121,7 +1189,7 @@ def run_watchdog(args):
                     check_attempts = 5
                     while check_attempts > 0:
                         try:
-                            check_server(args.host, args.port)
+                            check_server(server_host, server_port)
                             break
                         except CheckError as exc:
                             check_attempts -= 1
@@ -1137,10 +1205,10 @@ def run_watchdog(args):
                 hup_event.wait(cfg.server_polling_timeout)
 
             # reload domain list on hup signal
-            if hup_event.is_set():
+            if schedule not in ('once', 'force') and hup_event.is_set():
                 print('watchdog: reloading domains list requested by hup signal')
                 try:
-                    domains = check_domains_list(os.path.join(args.path, cfg.domains_list_name))
+                    domains_list = read_domains_list(os.path.join(account_path, cfg.domains_list_name))
                 except CheckError as exc:
                     print(f'watchdog: failed to reload domains list, keeping old one: {exc}')
 
@@ -1150,20 +1218,18 @@ def run_watchdog(args):
 
             # run validation
             validation_process = Process(target=run_validation, args=(
-                args.path,
-                args.acme,
-                domains,
-                args.contact,
-                args.group,
-                args.schedule == 'force',
+                account_path,
+                config,
+                domains_list,
+                schedule == 'force',
                 event_queue,
-                (args.host, args.port) if args.testing else None,
+                (server_host, server_port) if testing else None,
             ), daemon=True)
             validation_process.start()
             validation_pid = validation_process.pid
 
             # quit when only one validation was requested
-            if args.schedule in ('once', 'force'):
+            if schedule in ('once', 'force'):
                 validation_process.join()
                 print('watchdog: quitting, scheduled only once')
                 return validation_process.exitcode
@@ -1182,63 +1248,357 @@ def run_watchdog(args):
         safe_kill(server_pid)
 
 
+def filter_domains(domains, domains_list, domains_list_path):
+    """
+    Filter domains from domains list
+    """
+    main_domains = {sorted(subdomains, key=len)[0]: subdomains for subdomains in domains_list}
+    included_domains_list = []
+    for domain in domains:
+        if domain in main_domains:
+            included_domains_list.append(main_domains[domain])
+        else:
+            raise RuntimeError(f'domain {domain} is not included in {domains_list_path}')
+
+    return included_domains_list
+
+
+def run_renew(account_path, config, domains, force, testing):
+    """
+    Renew seleced domains
+    """
+    # connect to account
+    check_account_key(os.path.join(account_path, cfg.account_key_name), create=False)
+    connect_account(account_path, config, True, testing)
+    domains_list = read_domains_list(os.path.join(account_path, cfg.domains_list_name))
+
+    # filter domains
+    included_domains_list = filter_domains(domains, domains_list, os.path.join(account_path, cfg.domains_list_name))
+
+    # run renewal
+    run_watchdog(account_path, config, included_domains_list, 'force' if force else 'once', testing)
+
+
+def revoke_certificates(account_path, config, account_info, domains_list, testing):
+    """
+    Revoke certificates with account id
+    """
+    validate_acme = not testing
+
+    revoked = 0
+    acme_directory = account_info['acme_directory']
+    for subdomains in domains_list:
+        try:
+            main_domain = sorted(subdomains, key=len)[0]
+
+            # get certificate in DER format
+            certificate_path = os.path.join(account_path, cfg.certificates_path, main_domain, cfg.domain_cert)
+            if not os.path.exists(certificate_path):
+                print(f'missing certificate for {main_domain}, skipping')
+                continue
+
+            certificate = run_cmd([
+                'openssl', 'x509',
+                '-in', certificate_path,
+                '-outform', 'DER',
+            ], err_msg=f'cannot read certificate from {certificate_path}')
+
+            # request revocation
+            revocation_payload = {'certificate': b64(certificate)}
+            account_id = account_info['id']
+            account, _, _ = send_signed_request(
+                acme_directory['revokeCert'],
+                revocation_payload,
+                account_info,
+                f'cannot revoke certificate for {main_domain} from acount {account_id}',
+                validate_acme,
+            )
+
+            revoked += 1
+        except RuntimeError as exc:
+            print(exc)
+        except Exception:
+            traceback.print_exc()
+
+    return 0 if revoked == len(domains_list) else 1
+
+
+def run_revoke(account_path, config, domains, testing):
+    """
+    Revoke selected domains
+    """
+    # connect to account
+    check_account_key(os.path.join(account_path, cfg.account_key_name), create=False)
+    account_info = connect_account(account_path, config, True, testing)
+    domains_list = read_domains_list(os.path.join(account_path, cfg.domains_list_name))
+
+    # filter domains
+    included_domains_list = filter_domains(domains, domains_list, os.path.join(account_path, cfg.domains_list_name))
+
+    return revoke_certificates(account_path, config, account_info, included_domains_list, testing)
+
+
+def run_renew_all(account_path, config, force, testing):
+    """
+    Renew all domains
+    """
+    # connect to account
+    check_account_key(os.path.join(account_path, cfg.account_key_name), create=False)
+    connect_account(account_path, config, True, testing)
+    domains_list = read_domains_list(os.path.join(account_path, cfg.domains_list_name))
+
+    # run renewal
+    run_watchdog(account_path, config, domains_list, 'force' if force else 'once', testing)
+
+
+def run_revoke_all(account_path, config, testing):
+    """
+    Renew selected domains
+    """
+    # connect to account
+    check_account_key(os.path.join(account_path, cfg.account_key_name), create=False)
+    account_info = connect_account(account_path, config, True, testing)
+    domains_list = read_domains_list(os.path.join(account_path, cfg.domains_list_name))
+
+    return revoke_certificates(account_path, config, account_info, domains_list, testing)
+
+
+def run_auto(account_path, config, testing):
+    """
+    Renew all domains and monitor them
+    """
+    # connect to account
+    check_account_key(os.path.join(account_path, cfg.account_key_name), create=False)
+    connect_account(account_path, config, True, testing)
+    domains_list = read_domains_list(os.path.join(account_path, cfg.domains_list_name))
+
+    # run renewal
+    run_watchdog(account_path, config, domains_list, None, testing)
+
+
+def read_config(path):
+    """
+    Reads acme-tls configuration
+    """
+    def parse_port(value):
+        msg = 'port number must be a number between 1 and 65535'
+        try:
+            value = int(value)
+        except ValueError:
+            raise ValueError(msg)
+
+        if not (0 < value < 65536):
+            raise ValueError(msg)
+        else:
+            return value
+
+    def parse_acme(value):
+        msg = f'acme can be either one of {", ".join(cfg.acme_directories)} or can be https url pointing to acme directory'
+        if value in cfg.acme_directories:
+            return cfg.acme_directories[value]
+        else:
+            try:
+                parsed = urlparse(value)
+            except ValueError:
+                raise ValueError(msg)
+
+            if parsed.scheme != 'https':
+                raise ValueError(msg)
+            else:
+                return value
+
+    def parse_schedule(value):
+        msg = 'schedule hour muste be a number between 0 and 23'
+        try:
+            value = int(value)
+        except ValueError:
+            raise ValueError(msg)
+
+        if not (0 <= value < 24):
+            raise ValueError(msg)
+        else:
+            return value
+
+    def parse_contact(value):
+        contact = []
+        for part in value.split(' '):
+            part = part.strip()
+            if part:
+                contact.append(part)
+
+        return contact if contact else None
+
+    mandatory = set('acme host port'.split())
+    optional = set('contact group schedule done_cmd'.split())
+    parsers = {
+        'acme': parse_acme,
+        'port': parse_port,
+        'schedule': parse_schedule,
+        'contact': parse_contact,
+    }
+
+    try:
+        # read config
+        config = {}
+        with open(path) as config_file:
+            for line_num, line in enumerate(config_file, 1):
+                line = line.strip()
+
+                # ignore comments
+                if line.startswith('#') or not line:
+                    continue
+
+                # parse line
+                line = line.split('#', 1)[0]
+                key_value = line.split('=', 2)
+                if len(key_value) != 2:
+                    raise RuntimeError(f'missing = in {path}:{line_num}')
+                key, value = key_value
+                key = key.strip()
+                value = value.strip()
+                if key not in mandatory and key not in optional:
+                    raise RuntimeError(f'unknown option {key} in {path}:{line_num}')
+
+                value = value.strip()
+                if value:
+                    try:
+                        config[key] = parsers[key](value) if key in parsers else value
+                    except ValueError as exc:
+                        raise RuntimeError(f'incorrect option in {path}: {exc}')
+
+        # check mandatory keys
+        missing = mandatory - config.keys()
+        if missing:
+            raise RuntimeError(f'missing {", ".join(missing)} options in {path}')
+
+        return config
+    except FileNotFoundError:
+        raise RuntimeError(f'cannot find {path}')
+    except IOError as exc:
+        raise RuntimeError(f'cannot read {path}: {exc}')
+
+
+def check_openssl():
+    """
+    Check for openssl binary
+    """
+    run_cmd(['openssl', 'version'], err_msg='cannot find openssl binary, do you have it installed?')
+
+
 def main():
     """
     Start server and monitor certificates
     """
-    def schedule(string):
-        """
-        parse schedule argument
-        """
-        if string in ('once', 'force'):
-            return string
-        else:
-            hour = int(string)
-            if 0 <= hour < 24:
-                return hour
-            else:
-                raise ValueError()
-
-    def ca(string):
-        """
-        Parse acme argument
-        """
-        if string.lower() in cfg.acme_directories:
-            return cfg.acme_directories[string.lower()]
-
-        parsed = urlparse(string)
-        if parsed.scheme != 'https':
-            raise ValueError()
-
-        return string
-
     # parse script arguments
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=__doc__,
+        description=__doc__.strip(),
+        usage=argparse.SUPPRESS,
     )
+    subparsers = parser.add_subparsers(dest='command', help=argparse.SUPPRESS)
 
-    parser.add_argument('--path', metavar='account_dir', help='path to account directory with certificates')
-    parser.add_argument('--acme', metavar='ca', type=ca, help='certificate authority name or ACME url')
-    parser.add_argument('--contact', metavar='contact', nargs='*', help='update account contact information')
-    parser.add_argument('--new-account-key', action='store_true', default=False, help='create new account key if does not exist')
-    parser.add_argument('--host', metavar='host', default='::1', help='validation server hostname, by default ::1')
-    parser.add_argument('--port', metavar='port', default=7443, type=int, help='validation server port, by default 7443')
-    parser.add_argument('--group', metavar='group', default=None, help='validation and domain certificates user group')
-    parser.add_argument('--schedule', metavar='schedule', default='4', type=schedule, help='when to schedule certificate check (hour | once | force), by default 4')
-    parser.add_argument('--done-cmd', metavar='cmd', default=None, help='command to run after certificates validation is done')
-    parser.add_argument('--version', action='store_true', help='print version info')
+    # new account parser
+    new_parser = subparsers.add_parser('new-account', help='create new account')
+    new_parser.add_argument('account_path', help='path to account directory with configuration and certificates')
+    for group in new_parser._action_groups:
+        group.title = 'arguments'
+
+    # update account parser
+    update_parser = subparsers.add_parser('update-account', help='update existing account')
+    update_parser.add_argument('account_path', help='path to account directory with configuration and certificates')
+
+    # deactivate account
+    deactivate_parser = subparsers.add_parser('deactivate-account', help='deactivate existing account')
+    deactivate_parser.add_argument('account_path', help='path to account directory with configuration and certificates')
+
+    # run
+    run_parser = subparsers.add_parser('run', help='run certificate validatin and monitoring')
+    run_parser.add_argument('account_path', help='path to account directory with configuration and certificates')
+
+    # renew
+    renew_parser = subparsers.add_parser('renew', help='renew domain certificates')
+    renew_parser.add_argument('account_path', help='path to account directory with configuration and certificates')
+    renew_parser.add_argument('--domain', metavar='domain', nargs='+', required=True, help='domain to renew')
+    renew_parser.add_argument('--force', action='store_true', help='force domain renewal')
+
+    # revoke
+    revoke_parser = subparsers.add_parser('revoke', help='revoke domain certificates')
+    revoke_parser.add_argument('account_path',help='path to account directory with configuration and certificates')
+    revoke_parser.add_argument('--domain', metavar='domain', nargs='+', required=True, help='domain to revoke')
+
+    # renew-all
+    renew_all_parser = subparsers.add_parser('renew-all', help='renew certificates for all configured domains')
+    renew_all_parser.add_argument('account_path', help='path to account directory with configuration and certificates')
+    renew_all_parser.add_argument('--force', action='store_true', help='force domain renewal')
+
+    # revoke-all
+    revoke_all_parser = subparsers.add_parser('revoke-all', help='revoke certificates for all configured domains')
+    revoke_all_parser.add_argument('account_path', help='path to account directory with configuration and certificates')
+
+    # version
+    subparsers.add_parser('version', help='show acme-tls version')
+
+    # testing
     parser.add_argument('--testing', action='store_true', default=False, help=argparse.SUPPRESS)
-    args = parser.parse_args()
 
-    if args.version:
-        print(f'acme-tls {cfg.version}')
+    # parse
+    args = parser.parse_args()
+    try:
+        if args.command is None:
+            print(parser.description)
+            return 2
+        elif args.command == 'new-account':
+            check_openssl()
+            check_account_path(args.account_path)
+            config = read_config(os.path.join(args.account_path, 'config'))
+            return run_new_account(args.account_path, config, args.testing)
+        elif args.command == 'update-account':
+            check_openssl()
+            check_account_path(args.account_path)
+            config = read_config(os.path.join(args.account_path, 'config'))
+            return run_update_account(args.account_path, config, args.testing)
+        elif args.command == 'deactivate-account':
+            check_openssl()
+            check_account_path(args.account_path)
+            config = read_config(os.path.join(args.account_path, 'config'))
+            return run_deactivate_account(args.account_path, config, args.testing)
+        elif args.command == 'run':
+            check_openssl()
+            check_account_path(args.account_path)
+            config = read_config(os.path.join(args.account_path, 'config'))
+            return run_auto(args.account_path, config, args.testing)
+        elif args.command == 'renew':
+            check_openssl()
+            check_account_path(args.account_path)
+            config = read_config(os.path.join(args.account_path, 'config'))
+            return run_renew(args.account_path, config, args.domain, args.force, args.testing)
+        elif args.command == 'revoke':
+            check_openssl()
+            check_account_path(args.account_path)
+            config = read_config(os.path.join(args.account_path, 'config'))
+            return run_revoke(args.account_path, config, args.domain, args.testing)
+        elif args.command == 'renew-all':
+            check_openssl()
+            check_account_path(args.account_path)
+            config = read_config(os.path.join(args.account_path, 'config'))
+            return run_renew_all(args.account_path, config, args.force, args.testing)
+        elif args.command == 'revoke-all':
+            check_openssl()
+            check_account_path(args.account_path)
+            config = read_config(os.path.join(args.account_path, 'config'))
+            return run_revoke_all(args.account_path, config, args.testing)
+        elif args.command == 'version':
+            print(f'acme-tls {cfg.version}')
+            return 0
+    except RuntimeError as exc:
+        print(exc)
+        return 1
+    except Exception:
+        traceback.print_exc()
+        return 3
+    except KeyboardInterrupt:
+        print('watchdog: exiting on user request')
         return 0
-    elif args.path is not None and args.acme is not None:
-        return run_watchdog(args)
-    else:
-        parser.error('--path and --acme are required attributes')
-        return 2
 
 
 # entrypoint
