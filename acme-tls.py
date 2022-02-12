@@ -20,6 +20,7 @@ quick guide:
   cat > account_path/config         # paste configuration
   cat > account_path/domains.list   # paste domains
   acme-tls new-account account_path # create new account
+  # configure reverse proxy to forward traffic to acme-tls validations server
   acme-tls run account_path         # obtain certificates, monitor and renew if necessary
   # domain certificates are stored in acount/certificates
 
