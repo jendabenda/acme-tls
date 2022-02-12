@@ -1,43 +1,49 @@
 # acme-tls
 
-`acme-tls` creates and validates domain certificates using ACME `tls-alpn-01` challenge.
-`acme-tls` checks domain certificates once a day at 4am, accepting validation challenges
-on ::1 port 7443, by default. It reloads configuration with certificates recheck
-on HUP signal. Use reverse proxy (nginx, apache, ...) for routing https traffic
-to either your https server or `acme-tls`. Supported crypto is elliptic curve `secp384r1`.
+This tools can be used to obtain domain certificates using ACME `tls-alpn-01` challenge.
+It checks domain certificates once a day and renews them if necessary.
+Use reverse proxy (nginx, apache, ...) for routing https traffic to `acme-tls`
+validation server. Supported cryptographic primitive is elliptic curve secp384r1.
+
+## Features
+ * domain certificates using ACME protocol, `tls-alpn-01` challenge
+ * ACME account management
+ * domain certificates revocation
+ * elliptic curve cryptography
+ * no dependencies apart from `python` and `openssl`
+ * robust, covered by tests
 
 ## Quick start
- 1. create `account` directory to store account key and certificates
- 2. create `account/domains.list` with domains and their subdomains on each line
- 3. setup reverse proxy to redirect `tls-alpn-01` challenges to `acme-tls` validation server
- 4. create account key and run validation server with (assuming [let's encrypt](https://letsencrypt.org/) as CA)
-    `acme-tls.py --path account --acme letsencrypt --new-account-key --schedule once`
- 5. check if certificates were generated correctly, run validation server (assuming nginx proxy)
-    `acme-tls.py --path account --acme letsencrypt --done-cmd 'sudo systemctl reload nginx'`
+```bash
+mkdir account_path
+cat > account_path/config         # paste configuration
+cat > account_path/domains.list   # paste domains
+acme-tls new-account account_path # create new account
+# configure reverse proxy to forward packets to acme-tls validations server
+acme-tls run account_path         # obtain certificates, monitor and renew if necessary
+# domain certificates are stored in acount_path/certificates
+```
 
-## Example configuration:
+**account_path/config**
+```bash
+acme = letsencrypt  # acme certificate authority, i.e. letsencrypt,
+                    # letsencrypt_test or acme directory url
+contact =     # contact information for certificate authority, i.e. user@example.org, optional
+host = ::1    # validation server hostname
+port = 7443   # validation server port
+group =       # user group for generated certificates, i.e. www-data, optional
+schedule = 4  # hour which acme-tls tries to check and renew domain certificates, optional
+done_cmd =    # command to be run after successful batch with new domain certificates, optional
+```
 
-Configuration is saved in `account/domains.list`
+**account_path/domains.list**
 ```bash
 example.org
 example.net
 example.com, subdomain.example.com  # create multidomain certificate
 ```
 
-## Features
- * domain certificates using ACME protocol, `tls-alpn-01` challenge
- * elliptic curve cryptography certificates
- * no dependencies apart from `python` and `openssl`
- * small, test covered, auditable
-
-## License
-
-Author: Jan Procházka \
-License: none, public domain
-
-## Extra
-
-### Sample nginx configuration
+**nginx configuration**
 ```nginx
 # load stream module
 load_module /usr/lib/nginx/modules/ngx_stream_module.so;
@@ -59,3 +65,7 @@ stream {
 }
 ```
 
+## License
+
+Author: Jan Procházka \
+License: none, public domain
