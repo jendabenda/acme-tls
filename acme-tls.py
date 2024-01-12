@@ -287,7 +287,8 @@ class ValidationHandler(socketserver.BaseRequestHandler):
         ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         ssl_context.set_ciphers(cfg.server_ciphers)
         ssl_context.set_alpn_protocols(['acme-tls/1'])
-        ssl_context.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
+        ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        ssl_context.maximum_version = ssl.TLSVersion.TLSv1_3
 
         try:
             ssl_context.load_cert_chain(certfile=certfile, keyfile=keyfile)
